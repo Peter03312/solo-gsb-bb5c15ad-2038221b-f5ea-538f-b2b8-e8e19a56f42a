@@ -708,6 +708,9 @@ curl -s -X POST http://localhost:8080/api/v1/zones/Z-A/co-occupancy \
   （外边界计入、洞及其边界不计）；一车穿洞或驶出生效窗口期间不参与比较。
   把两车同时在区的时间按轨迹点时刻切分后，相对位置随时间线性变化，
   距离平方为开口向上抛物线，**解析**求出严格小于阈值的子区间。
+  求根/比较对**任意合法有限坐标与阈值**（量级可到约 1e308）溢出安全：
+  全程按最大分量尺度整体缩放到无量纲空间计算，再用凸组合还原端点，
+  恰等阈值不会被浮点舍入误判为严格小于（详见下文“极大有限坐标”一节）；
 - **同一已提交读视图**：区域（含指定修订号）与全部车次点集（含指定/最新版本）在
   **同一个只读快照事务**内读取，并发登记/上传/更正不会拼出不存在的组合。
 - 响应：
@@ -970,6 +973,107 @@ curl -s -X POST http://localhost:8080/api/v1/zones/Z-A/contact-tracing \
     "track_versions": {"A": 1}
   }'
 ```
+
+## 极大有限坐标下的相遇与传播（溢出安全）
+
+相遇距离判定对**任意合法有限坐标/阈值**（坐标分量与阈值均为有限 IEEE-754 双精度数，
+量级可到约 1e308）保持正确。内部不再直接计算 `dx*dx`、`max_distance*max_distance`
+这类平方（坐标在 1e154 量级以上时平方即溢出为 `inf`，曾使合法相遇漏报、接触传播
+误判不可达）：原子段内的抛物线求根先按
+`max(|相对位置分量|, |相对速度分量|, 阈值)` **整体缩放到无量纲空间**再解，
+区间端点用凸组合还原，最小距离按缩放后的斜边乘回尺度因子；接点处的“严格小于阈值”
+判定用 `hypot`（带溢出保护）并在与阈值几乎相等时回退到分子/分母精确平方的有理数比较，
+因此**恰等阈值永远不会被舍入误判成严格小于**。请求/响应字段、可选 `revision` 与
+逐车 `track_versions`、同一已提交读视图语义均不变；合法无相遇仍返回空结果，
+非法阈值（非正/非有限）与未知车次仍按原状态报错。
+
+示例：在边长 4e155m 的全天危险区中，`big-A` 静止于 `(0,0)`、`big-B` 静止于
+`(1e155,0)`，两车在区内连续静止 10 秒；阈值 `2e155` 时平面距离 1e155 **严格小于**
+阈值，proximity 返回整段相遇、区间最小距离 1e155，contact-tracing 判 `big-B` 自
+窗口起点经 1 跳可达：
+
+```bash
+# 1) 登记覆盖极大坐标范围的危险区
+curl -s -X POST http://localhost:8080/api/v1/zones \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "zone_id": "Z-BIG",
+    "exterior": [[-2e155,-2e155],[2e155,-2e155],[2e155,2e155],[-2e155,2e155]],
+    "holes": [],
+    "windows": [{"start": "2026-09-30T00:00:00Z", "end": "2026-10-01T00:00:00Z"}]
+  }'
+
+# 2) 上传两车静止轨迹（相距 1e155 米，均为有限坐标）
+curl -s -X POST http://localhost:8080/api/v1/trips/big-A/points \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[
+    {"point_id":"a1","ts":"2026-09-30T00:00:00Z","x":0.0,"y":0.0},
+    {"point_id":"a2","ts":"2026-09-30T00:00:10Z","x":0.0,"y":0.0}]}'
+curl -s -X POST http://localhost:8080/api/v1/trips/big-B/points \
+  -H 'Content-Type: application/json' \
+  -d '{"points":[
+    {"point_id":"b1","ts":"2026-09-30T00:00:00Z","x":1e155,"y":0.0},
+    {"point_id":"b2","ts":"2026-09-30T00:00:10Z","x":1e155,"y":0.0}]}'
+
+# 3) 近距离相遇复核（阈值 2e155 > 距离 1e155）
+curl -s -X POST http://localhost:8080/api/v1/zones/Z-BIG/proximity \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "trip_ids": ["big-A", "big-B"],
+    "since": "2026-09-30T00:00:00Z",
+    "until": "2026-09-30T00:00:10Z",
+    "max_distance": 2e155
+  }'
+```
+
+```json
+{
+  "zone_id": "Z-BIG",
+  "since": "2026-09-30T00:00:00Z",
+  "until": "2026-09-30T00:00:10Z",
+  "max_distance": 2e+155,
+  "trips": [
+    {"trip_id": "big-A", "track_version": 1, "point_count": 2},
+    {"trip_id": "big-B", "track_version": 1, "point_count": 2}
+  ],
+  "pairs": [
+    {
+      "trip_ids": ["big-A", "big-B"],
+      "intervals": [
+        {"start": "2026-09-30T00:00:00Z", "end": "2026-09-30T00:00:10Z",
+         "duration_sec": 10.0, "min_distance": 1e+155}
+      ]
+    }
+  ]
+}
+```
+
+```bash
+# 4) 接触传播追踪：big-B 自窗口起点经 big-A 一跳可达
+curl -s -X POST http://localhost:8080/api/v1/zones/Z-BIG/contact-tracing \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source_trip_id": "big-A",
+    "trip_ids": ["big-A", "big-B"],
+    "since": "2026-09-30T00:00:00Z",
+    "until": "2026-09-30T00:00:10Z",
+    "max_distance": 2e155
+  }'
+```
+
+```json
+{
+  "results": [
+    {"trip_id": "big-A", "reachable": true,  "arrived_at": "2026-09-30T00:00:00Z", "hops": 0, "chain": ["big-A"]},
+    {"trip_id": "big-B", "reachable": true,  "arrived_at": "2026-09-30T00:00:00Z", "hops": 1, "chain": ["big-A", "big-B"]}
+  ]
+}
+```
+
+把阈值改为恰为 `1e155`（距离**恰等**阈值）时，同一请求 proximity 返回
+`"pairs": []`，contact-tracing 中 `big-B` 为
+`{"reachable": false, "arrived_at": null, "hops": null, "chain": null}`；
+阈值传 `0`、`"NaN"`、`"Infinity"` 等仍按非法阈值（400/422）拒绝，未知车次仍为 404。
 
 ## 单车一次作业危险区风险预算复核
 

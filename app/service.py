@@ -1626,11 +1626,10 @@ class AuditService:
         def _joint_eligible(t: float) -> bool:
             """相接点 t 是否允许跨接合并：距离严格小于阈值且两车在 t 均有
             “轨迹覆盖且位于生效危险区”（t 落入双方覆盖的半开公共在区时间）。"""
-            # 距离严格小于阈值（比较平方，避免开方误差使恰等阈值被误判为严格小于）
+            # 距离严格小于阈值（溢出安全：极大有限坐标下平方会变 inf 而漏判）
             ax, ay = self._position_at(points_a, ts_a, t)
             bx, by = self._position_at(points_b, ts_b, t)
-            dx, dy = ax - bx, ay - by
-            if dx * dx + dy * dy >= max_distance * max_distance:
+            if not self._distance_lt(ax - bx, ay - by, max_distance):
                 return False
             # 两车轨迹覆盖且同时位于生效危险区：t 属于某一公共在区半开区间
             if not any(s <= t < e for s, e in common):
@@ -1657,6 +1656,38 @@ class AuditService:
                 merged.append([s, e, min_d])
         return [(s, e, md) for s, e, md in merged if e - s > self.min_duration]
 
+    @staticmethod
+    def _distance_lt(dx: float, dy: float, limit: float) -> bool:
+        """溢出安全地判定平面欧氏距离是否**严格小于** limit。
+
+        极大有限坐标（如 1e155）下 dx*dx、limit*limit 会溢出为 inf，直接比较
+        平方会把本该满足的相遇误判为不满足。常规路径用 math.hypot（内部按
+        因子缩放，不会中间溢出）；仅当斜边与阈值几乎相等（浮点舍入无法
+        分辨）时，回退到分子/分母精确平方的 Fraction 比较，保证恰等阈值
+        不会被误判成严格小于。
+        """
+        h = math.hypot(dx, dy)
+        tol = 2.0 * sys.float_info.epsilon * max(
+            math.fabs(h), math.fabs(limit), sys.float_info.min
+        )
+        if h < limit - tol:
+            return True
+        if h > limit + tol:
+            return False
+        # 落在舍入不确定带内（含 h=inf、恰等阈值）：精确有理数判定
+        return AuditService._exact_sq_lt(dx, dy, limit)
+
+    @staticmethod
+    def _exact_sq_lt(dx: float, dy: float, limit: float) -> bool:
+        """用整数精确比较 dx²+dy² < limit²（float 按值精确转为有理数）。"""
+        try:
+            sx = Fraction(dx)
+            sy = Fraction(dy)
+            sl = Fraction(limit)
+        except (OverflowError, ValueError):
+            return False
+        return sx * sx + sy * sy < sl * sl
+
     def _close_interval_on_piece(
         self,
         points_a: List[Any],
@@ -1667,22 +1698,43 @@ class AuditService:
         b: float,
         max_distance: float,
     ) -> Optional[Tuple[float, float, float]]:
-        """原子段 [a, b] 内距离严格小于阈值的子区间 (s, e, 最小距离)；无则 None。"""
+        """原子段 [a, b] 内距离严格小于阈值的子区间 (s, e, 最小距离)；无则 None。
+
+        输入坐标/阈值均为合法有限值，但量级可达约 1e308。直接计算平方会
+        溢出为 inf/NaN（例如相对距离 1e155、阈值 2e155 时两者平方都溢出），
+        故全程按 M = max(|相对位置分量|, |相对速度分量|, 阈值) 缩放到
+        [-1,1] 的无量纲空间求解：缩放保持 u 根不变，缩放后的量平方/交叉积
+        均为 O(1)，判别式至多 O(16)，不发生溢出，区间端点 u 与最小距离
+        最后再还原。零时长触及仍不产生区间。
+        """
         ax0, ay0 = self._position_at(points_a, ts_a, a)
         ax1, ay1 = self._position_at(points_a, ts_a, b)
         bx0, by0 = self._position_at(points_b, ts_b, a)
         bx1, by1 = self._position_at(points_b, ts_b, b)
-        # 相对位置 r(u) = r0 + dv·u，u ∈ [0,1]；|r(u)|² < d² 为开口向上抛物线不等式
+        # 相对位置 r(u) = r0 + dv·u，u ∈ [0,1]；|r(u)|² < d² 为开口向上抛物线
         rx0, ry0 = ax0 - bx0, ay0 - by0
         dvx, dvy = (ax1 - bx1) - rx0, (ay1 - by1) - ry0
-        qa = dvx * dvx + dvy * dvy
-        qc = rx0 * rx0 + ry0 * ry0 - max_distance * max_distance
+
+        scale = max(
+            math.fabs(rx0), math.fabs(ry0),
+            math.fabs(dvx), math.fabs(dvy),
+            math.fabs(max_distance),
+            sys.float_info.min,
+        )
+        x0, y0 = rx0 / scale, ry0 / scale
+        vx, vy = dvx / scale, dvy / scale
+        d = max_distance / scale
+
+        # 缩放后求解 (x0+vx·u)² + (y0+vy·u)² < d²
+        qa = vx * vx + vy * vy
+        qc = x0 * x0 + y0 * y0 - d * d
         if qa == 0.0:
-            # 相对静止：整段要么全满足要么全不满足
-            if qc < 0.0:
-                return (a, b, math.sqrt(rx0 * rx0 + ry0 * ry0))
-            return None
-        qb = 2.0 * (rx0 * dvx + ry0 * dvy)
+            # 相对静止：整段要么全满足要么全不满足（比较严格小于阈值）
+            if not self._distance_lt(rx0, ry0, max_distance):
+                return None
+            min_d = min(math.hypot(rx0, ry0), max_distance)
+            return (a, b, min_d)
+        qb = 2.0 * (x0 * vx + y0 * vy)
         disc = qb * qb - 4.0 * qa * qc
         if disc <= 0.0:
             return None  # 始终不满足，或仅瞬时相切（零时长触及忽略）
@@ -1692,21 +1744,22 @@ class AuditService:
         lo_u, hi_u = max(u1, 0.0), min(u2, 1.0)
         if hi_u <= lo_u:
             return None
-        s = a + lo_u * (b - a)
-        e = a + hi_u * (b - a)
+        # 时间同样用凸组合计算，避免 u·(b-a) 在极大时刻上溢出；结果必在 [a,b]
+        s = (1.0 - lo_u) * a + lo_u * b
+        e = (1.0 - hi_u) * a + hi_u * b
         if e - s <= self.min_duration:
             return None
 
-        def _dist(u: float) -> float:
-            rx = rx0 + dvx * u
-            ry = ry0 + dvy * u
-            return math.sqrt(rx * rx + ry * ry)
+        def _scaled_dist(u: float) -> float:
+            return scale * math.hypot(x0 + vx * u, y0 + vy * u)
 
         u_star = -qb / (2.0 * qa)  # 抛物线顶点：距离最小处
         if lo_u <= u_star <= hi_u:
-            min_d = _dist(u_star)
+            min_d = _scaled_dist(u_star)
         else:
-            min_d = min(_dist(lo_u), _dist(hi_u))
+            min_d = min(_scaled_dist(lo_u), _scaled_dist(hi_u))
+        # 端点处按严格小于阈值语义计入，浮点舍入的越界钳回阈值以内
+        min_d = min(min_d, math.nextafter(max_distance, 0.0))
         return (s, e, min_d)
 
     @staticmethod
@@ -1719,9 +1772,13 @@ class AuditService:
         pa, pb = points[idx], points[idx + 1]
         t0, t1 = pa["ts_epoch"], pb["ts_epoch"]
         ratio = 0.0 if t1 <= t0 else (t - t0) / (t1 - t0)
+        # 凸组合形式插值：极大有限坐标下 pa.x + (pb.x-pa.x)*ratio 可能溢出
+        # （两端同为 ~1e308 但差值 ~1e292 时），(1-ratio)·p0 + ratio·p1
+        # 结果必在两端点之间，只要端点有限就不会溢出。
+        w0, w1 = 1.0 - ratio, ratio
         return (
-            pa["x"] + (pb["x"] - pa["x"]) * ratio,
-            pa["y"] + (pb["y"] - pa["y"]) * ratio,
+            w0 * pa["x"] + w1 * pb["x"],
+            w0 * pa["y"] + w1 * pb["y"],
         )
 
     # ------------------------------------------------------------------
