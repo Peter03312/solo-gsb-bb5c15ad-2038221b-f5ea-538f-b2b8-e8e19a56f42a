@@ -33,6 +33,33 @@ def _iso_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _dist_strictly_less(dx: float, dy: float, limit: float) -> bool:
+    """有限平面差 (dx, dy) 的欧氏距离是否严格小于正且有限的 limit。
+
+    直接比较平方在极大有限坐标下会溢出 float64（如相距 1e155 米时平方为
+    1e310 → inf），使“严格小于阈值”被误判；此时把差值与阈值同除一个正比例
+    再比较平方——数学上与 |(dx,dy)| < limit 完全等价，且仍是比较平方，
+    不会引入开方误差使恰等阈值被误判为严格小于。差值本身溢出（inf）说明
+    真实距离已超出 float64 有限范围，必然不小于任何有限阈值。
+    """
+    r2 = dx * dx + dy * dy
+    l2 = limit * limit
+    if math.isfinite(r2) and math.isfinite(l2):
+        return r2 < l2
+    m = max(abs(dx), abs(dy), limit)
+    if not math.isfinite(m):
+        return False  # 差值溢出 float64：真实距离超出任何有限阈值
+    return (dx / m) * (dx / m) + (dy / m) * (dy / m) < (limit / m) * (limit / m)
+
+
+def _round_min_distance(min_d: float) -> float:
+    """响应中的区间最小距离：常规值保留 6 位小数（既有行为）；
+    非零极小值按 6 位小数会被舍成 0.0（丢失真实距离），此时原样返回。"""
+    if 0.0 < min_d < 1e-6:
+        return min_d
+    return round(min_d, 6)
+
+
 def _finite_float(value: Fraction) -> float:
     """把非负精确值（Fraction）转换为可 JSON 序列化的有限浮点数。
 
@@ -1555,7 +1582,7 @@ class AuditService:
                                 "start": _iso_z(datetime.fromtimestamp(s, timezone.utc)),
                                 "end": _iso_z(datetime.fromtimestamp(e, timezone.utc)),
                                 "duration_sec": round(e - s, 6),
-                                "min_distance": round(min_d, 6),
+                                "min_distance": _round_min_distance(min_d),
                             }
                             for s, e, min_d in intervals
                         ],
@@ -1626,11 +1653,11 @@ class AuditService:
         def _joint_eligible(t: float) -> bool:
             """相接点 t 是否允许跨接合并：距离严格小于阈值且两车在 t 均有
             “轨迹覆盖且位于生效危险区”（t 落入双方覆盖的半开公共在区时间）。"""
-            # 距离严格小于阈值（比较平方，避免开方误差使恰等阈值被误判为严格小于）
+            # 距离严格小于阈值（比较平方，避免开方误差使恰等阈值被误判为严格小于；
+            # 极大有限坐标下平方溢出时按同一比例缩放后比较，判定不变）
             ax, ay = self._position_at(points_a, ts_a, t)
             bx, by = self._position_at(points_b, ts_b, t)
-            dx, dy = ax - bx, ay - by
-            if dx * dx + dy * dy >= max_distance * max_distance:
+            if not _dist_strictly_less(ax - bx, ay - by, max_distance):
                 return False
             # 两车轨迹覆盖且同时位于生效危险区：t 属于某一公共在区半开区间
             if not any(s <= t < e for s, e in common):
@@ -1675,6 +1702,20 @@ class AuditService:
         # 相对位置 r(u) = r0 + dv·u，u ∈ [0,1]；|r(u)|² < d² 为开口向上抛物线不等式
         rx0, ry0 = ax0 - bx0, ay0 - by0
         dvx, dvy = (ax1 - bx1) - rx0, (ay1 - by1) - ry0
+        # 极大有限坐标/阈值下平方会溢出 float64（如 1e155 的平方 → inf），
+        # 极小时平方会下溢为 0——都会使距离判定、区间端点与最小距离出错；
+        # 此时改走同比例缩放求解（数学上是同一条抛物线，根不变）
+        m = max(abs(rx0), abs(ry0), abs(dvx), abs(dvy), max_distance)
+        if not 1e-76 <= m <= 1e76:
+            return self._close_interval_on_piece_scaled(
+                (ax0, ay0, ax1, ay1),
+                (bx0, by0, bx1, by1),
+                (rx0, ry0, dvx, dvy),
+                a,
+                b,
+                max_distance,
+                m,
+            )
         qa = dvx * dvx + dvy * dvy
         qc = rx0 * rx0 + ry0 * ry0 - max_distance * max_distance
         if qa == 0.0:
@@ -1708,6 +1749,76 @@ class AuditService:
         else:
             min_d = min(_dist(lo_u), _dist(hi_u))
         return (s, e, min_d)
+
+    def _close_interval_on_piece_scaled(
+        self,
+        pos_a: Tuple[float, float, float, float],
+        pos_b: Tuple[float, float, float, float],
+        rel: Tuple[float, float, float, float],
+        a: float,
+        b: float,
+        max_distance: float,
+        m: float,
+    ) -> Optional[Tuple[float, float, float]]:
+        """极大/极小有限量下的抛物线求解：同比例缩放，避免平方溢出/下溢。
+
+        相对位置、相对速度与阈值同除一个正比例 scale 后，|r(u)|² < d² 的根
+        （相遇区间端点）在数学上不变，最小距离再乘回 scale；缩放后各量不超过
+        O(1)，平方不会溢出也不会下溢。相对差值本身溢出 float64（坐标异号
+        极大）时，改按两车位置坐标与阈值的最大模缩放，并在缩放后的坐标系里
+        重新求相对量。最小距离只在相遇区间存在时返回，真实值必然小于阈值
+        （有限），乘回不会溢出；仍以最大有限浮点值兜底保证可序列化。
+        """
+        rx0, ry0, dvx, dvy = rel
+        if math.isfinite(m):
+            scale = m
+            srx0, sry0 = rx0 / scale, ry0 / scale
+            sdvx, sdvy = dvx / scale, dvy / scale
+        else:
+            ax0, ay0, ax1, ay1 = pos_a
+            bx0, by0, bx1, by1 = pos_b
+            scale = max(
+                abs(ax0), abs(ay0), abs(ax1), abs(ay1),
+                abs(bx0), abs(by0), abs(bx1), abs(by1),
+                max_distance,
+            )
+            srx0, sry0 = ax0 / scale - bx0 / scale, ay0 / scale - by0 / scale
+            srx1, sry1 = ax1 / scale - bx1 / scale, ay1 / scale - by1 / scale
+            sdvx, sdvy = srx1 - srx0, sry1 - sry0
+        sd = max_distance / scale
+        qa = sdvx * sdvx + sdvy * sdvy
+        qc = srx0 * srx0 + sry0 * sry0 - sd * sd
+        if qa == 0.0:
+            # 相对静止：整段要么全满足要么全不满足
+            if qc < 0.0:
+                return (a, b, min(scale * math.hypot(srx0, sry0), sys.float_info.max))
+            return None
+        qb = 2.0 * (srx0 * sdvx + sry0 * sdvy)
+        disc = qb * qb - 4.0 * qa * qc
+        if disc <= 0.0:
+            return None  # 始终不满足，或仅瞬时相切（零时长触及忽略）
+        root = math.sqrt(disc)
+        u1 = (-qb - root) / (2.0 * qa)
+        u2 = (-qb + root) / (2.0 * qa)
+        lo_u, hi_u = max(u1, 0.0), min(u2, 1.0)
+        if hi_u <= lo_u:
+            return None
+        s = a + lo_u * (b - a)
+        e = a + hi_u * (b - a)
+        if e - s <= self.min_duration:
+            return None
+
+        def _dist(u: float) -> float:
+            rx = srx0 + sdvx * u
+            ry = sry0 + sdvy * u
+            return scale * math.hypot(rx, ry)
+
+        u_star = -qb / (2.0 * qa)  # 抛物线顶点：距离最小处
+        if lo_u <= u_star <= hi_u:
+            min_d = _dist(u_star)
+        else:
+            min_d = min(_dist(lo_u), _dist(hi_u))
+        return (s, e, min(min_d, sys.float_info.max))
 
     @staticmethod
     def _position_at(
